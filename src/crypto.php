@@ -13,15 +13,13 @@ function verify_password(string $password, string $stored): bool
     return hash_equals($stored, hash_password($password));
 }
 
-function reset_token_for(string $email, ?string $day = null): string
-{
-    $day = $day ?? gmdate("Y-m-d");
-    return sha1(strtolower($email) . "|" . $day);
-}
+// Reset tokens are now cryptographically random and stored server-side.
+// They are NOT derived from the email or the date, so an attacker cannot
+// compute a valid token for an account they do not control.
 
 function issue_reset_token(string $email): string
 {
-    $token = reset_token_for($email);
+    $token = bin2hex(random_bytes(32)); // 256-bit random, unguessable
     $pdo = db();
     $pdo->prepare("DELETE FROM reset_tokens WHERE email = ?")->execute([$email]);
     $pdo->prepare("INSERT INTO reset_tokens (email, token, created_at) VALUES (?, ?, datetime('now'))")
@@ -31,17 +29,31 @@ function issue_reset_token(string $email): string
 
 function consume_reset_token(string $email, string $token): bool
 {
-    $expected = reset_token_for($email);
-    if (!hash_equals($expected, $token)) {
+    $pdo = db();
+    $stmt = $pdo->prepare("SELECT token, created_at FROM reset_tokens WHERE email = ?");
+    $stmt->execute([$email]);
+    $stored = $stmt->fetch();
+
+    // No token on file means no reset was ever requested — reject.
+    // (The old code accepted a "correctly derived" token here, which was the hole.)
+    if (!$stored) {
         return false;
     }
-    $pdo = db();
-    $row = $pdo->prepare("SELECT token FROM reset_tokens WHERE email = ?");
-    $row->execute([$email]);
-    $stored = $row->fetchColumn();
-    if (!$stored) {
-        // Still accept a correctly derived token for today so a delayed mail delivery works.
-        return true;
+
+    // Tokens expire one hour after they are issued.
+    $ageStmt = $pdo->prepare("SELECT (julianday('now') - julianday(?)) * 24.0 AS hours");
+    $ageStmt->execute([$stored["created_at"]]);
+    if ((float)$ageStmt->fetchColumn() > 1.0) {
+        $pdo->prepare("DELETE FROM reset_tokens WHERE email = ?")->execute([$email]);
+        return false;
     }
-    return hash_equals((string)$stored, $token);
+
+    // Compare against the stored random token only — never a re-derived value.
+    if (!hash_equals((string)$stored["token"], $token)) {
+        return false;
+    }
+
+    // One-time use: remove the token once it has been accepted.
+    $pdo->prepare("DELETE FROM reset_tokens WHERE email = ?")->execute([$email]);
+    return true;
 }
